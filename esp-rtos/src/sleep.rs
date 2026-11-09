@@ -105,20 +105,61 @@ pub const DIAG_SLEPT_US: usize = 5;
 /// refused the previous pass.
 pub const DIAG_GATE_US: usize = 6;
 
-static DIAG: [portable_atomic::AtomicU64; 10] =
-    [const { portable_atomic::AtomicU64::new(0) }; 10];
-static DIAG_LAST_PASS_US: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+// ⚠️ Every counter in this module is a NATIVE 32-bit atomic, never a 64-bit one.
+// Xtensa has no 64-bit atomics, so `portable_atomic::AtomicU64` falls back to a global
+// table of 67 spinlocks picked by address hash, taken WITHOUT masking interrupts. These
+// counters are bumped inside `SCHEDULER.with` (the idle hook, the embassy timer queue),
+// i.e. while holding the scheduler lock. If the other core holds the same hashed lock (any
+// unrelated `AtomicU64` that shares the bucket) and its task-switch interrupt fires, that
+// interrupt spins for the scheduler lock while this core spins for the fallback lock: both
+// cores hang with interrupts masked and no watchdog can run. HW-captured 2026-11-09 on an
+// ESP32-S3 (core 0 in `_embassy_time_schedule_wake` on `SCHED_HIST`'s bucket, core 1 in
+// `trigger_task_switch` interrupted inside an app `AtomicU64::store`).
+use core::sync::atomic::AtomicU32;
+
+/// A microsecond total kept as whole milliseconds plus a sub-millisecond remainder, both
+/// native 32-bit atomics (49 days before the ms word wraps, vs 71 minutes for raw µs).
+struct UsTotal {
+    ms: AtomicU32,
+    rem_us: AtomicU32,
+}
+
+impl UsTotal {
+    const fn new() -> Self {
+        Self { ms: AtomicU32::new(0), rem_us: AtomicU32::new(0) }
+    }
+
+    fn add(&self, us: u64) {
+        use core::sync::atomic::Ordering::Relaxed;
+        let r = self.rem_us.fetch_add((us % 1000) as u32, Relaxed) + (us % 1000) as u32;
+        let carry = r / 1000;
+        if carry > 0 {
+            self.rem_us.fetch_sub(carry * 1000, Relaxed);
+        }
+        self.ms.fetch_add((us / 1000) as u32 + carry, Relaxed);
+    }
+
+    fn get(&self) -> u64 {
+        use core::sync::atomic::Ordering::Relaxed;
+        self.ms.load(Relaxed) as u64 * 1000 + self.rem_us.load(Relaxed) as u64
+    }
+}
+
+static DIAG_COUNT: [AtomicU32; DIAG_SLEPT_US] = [const { AtomicU32::new(0) }; DIAG_SLEPT_US];
+/// `DIAG_SLEPT_US` then the four `DIAG_GATE_US` totals.
+static DIAG_US: [UsTotal; 5] = [const { UsTotal::new() }; 5];
+/// Low 32 bits of the last idle-pass time (µs); only ever differenced, so wrapping is fine.
+static DIAG_LAST_PASS_US: AtomicU32 = AtomicU32::new(0);
 static DIAG_LAST_GATE: portable_atomic::AtomicUsize = portable_atomic::AtomicUsize::new(usize::MAX);
 
 fn diag_count(idx: usize) {
-    DIAG[idx].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    DIAG_COUNT[idx].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     if idx < DIAG_SLEPT {
-        let now = crate::now();
+        let now = crate::now() as u32;
         let last = DIAG_LAST_PASS_US.swap(now, core::sync::atomic::Ordering::Relaxed);
         let prev = DIAG_LAST_GATE.swap(idx, core::sync::atomic::Ordering::Relaxed);
         if prev < DIAG_SLEPT && last != 0 {
-            DIAG[DIAG_GATE_US + prev]
-                .fetch_add(now.saturating_sub(last), core::sync::atomic::Ordering::Relaxed);
+            DIAG_US[1 + prev].add(now.wrapping_sub(last) as u64);
         }
     } else {
         DIAG_LAST_GATE.store(usize::MAX, core::sync::atomic::Ordering::Relaxed);
@@ -128,14 +169,19 @@ fn diag_count(idx: usize) {
 /// Snapshot of the light-sleep idle hook's gate/sleep counters, indexed by the `DIAG_*`
 /// constants. Diagnostic aid for judging why the chip does or does not sleep.
 pub fn sleep_diag() -> [u64; 10] {
-    core::array::from_fn(|i| DIAG[i].load(core::sync::atomic::Ordering::Relaxed))
+    core::array::from_fn(|i| {
+        if i < DIAG_SLEPT_US {
+            DIAG_COUNT[i].load(core::sync::atomic::Ordering::Relaxed) as u64
+        } else {
+            DIAG_US[i - DIAG_SLEPT_US].get()
+        }
+    })
 }
 
 /// Histogram of the REQUESTED light-sleep duration (next_wakeup - now) at each committed
 /// sleep, so a bench can see the wake cadence (what limits sleep length). Buckets (ms):
 /// [<2, 2-4, 4-8, 8-16, 16-32, 32-64, 64-160, >=160].
-static SLEEP_HIST: [portable_atomic::AtomicU64; 8] =
-    [const { portable_atomic::AtomicU64::new(0) }; 8];
+static SLEEP_HIST: [AtomicU32; 8] = [const { AtomicU32::new(0) }; 8];
 
 fn hist_bump(us: u64) {
     let ms = us / 1000;
@@ -161,7 +207,7 @@ fn hist_bump(us: u64) {
 
 /// Snapshot of the requested-sleep-duration histogram (see [`SLEEP_HIST`]).
 pub fn sleep_hist() -> [u64; 8] {
-    core::array::from_fn(|i| SLEEP_HIST[i].load(core::sync::atomic::Ordering::Relaxed))
+    core::array::from_fn(|i| SLEEP_HIST[i].load(core::sync::atomic::Ordering::Relaxed) as u64)
 }
 
 /// Attributes timer-queue task wakeups by task priority, so a bench can see WHICH tasks are
@@ -169,8 +215,7 @@ pub fn sleep_hist() -> [u64; 8] {
 /// prio 1-2 = LoRa hp-thread / esp-radio timer thread, prio 3-15, prio 16-31 = BTDM
 /// controller task]. Only counts wakeups delivered via the RTOS timer queue (embassy
 /// `Timer` expirations / scheduled task wakeups), not direct hardware-IRQ wakeups.
-static WAKE_BY_PRIO: [portable_atomic::AtomicU64; 4] =
-    [const { portable_atomic::AtomicU64::new(0) }; 4];
+static WAKE_BY_PRIO: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
 
 pub(crate) fn note_timer_wake(prio: usize) {
     let b = if prio == 0 {
@@ -187,15 +232,14 @@ pub(crate) fn note_timer_wake(prio: usize) {
 
 /// Snapshot of timer-queue wakeups by priority bucket (see [`WAKE_BY_PRIO`]).
 pub fn wake_by_prio() -> [u64; 4] {
-    core::array::from_fn(|i| WAKE_BY_PRIO[i].load(core::sync::atomic::Ordering::Relaxed))
+    core::array::from_fn(|i| WAKE_BY_PRIO[i].load(core::sync::atomic::Ordering::Relaxed) as u64)
 }
 
 /// The HARDWARE wakeup cause after each committed light sleep, read from the RTC/PMU wakeup
 /// status. This is the DEFINITIVE "what woke the SoC": buckets [Timer, Bt, Gpio, Uart, Ext1,
 /// Other/none]. Timer = a scheduled deadline (embassy or esp-rtos); Bt = the BLE controller;
 /// the rest = peripheral pads / UART RX.
-static WAKE_CAUSE: [portable_atomic::AtomicU64; 6] =
-    [const { portable_atomic::AtomicU64::new(0) }; 6];
+static WAKE_CAUSE: [AtomicU32; 6] = [const { AtomicU32::new(0) }; 6];
 
 fn note_wake_cause() {
     use esp_hal::rtc_cntl::WakeupSource as S;
@@ -218,14 +262,13 @@ fn note_wake_cause() {
 
 /// Snapshot of the hardware wakeup-cause counters (see [`WAKE_CAUSE`]).
 pub fn wake_cause() -> [u64; 6] {
-    core::array::from_fn(|i| WAKE_CAUSE[i].load(core::sync::atomic::Ordering::Relaxed))
+    core::array::from_fn(|i| WAKE_CAUSE[i].load(core::sync::atomic::Ordering::Relaxed) as u64)
 }
 
 /// Histogram of the delays EMBASSY tasks schedule (`Timer::after` etc.), so a bench can see
 /// each task's period (one hot fast timer vs many slow ones). Buckets (ms): [<4, 4-16,
 /// 16-64, 64-256, 256-1024, >=1024].
-static SCHED_HIST: [portable_atomic::AtomicU64; 6] =
-    [const { portable_atomic::AtomicU64::new(0) }; 6];
+static SCHED_HIST: [AtomicU32; 6] = [const { AtomicU32::new(0) }; 6];
 
 pub(crate) fn note_sched(delay_us: u64) {
     let ms = delay_us / 1000;
@@ -247,9 +290,10 @@ pub(crate) fn note_sched(delay_us: u64) {
 
 /// Snapshot of the embassy scheduled-delay histogram (see [`SCHED_HIST`]).
 pub fn sched_hist() -> [u64; 6] {
-    core::array::from_fn(|i| SCHED_HIST[i].load(core::sync::atomic::Ordering::Relaxed))
+    core::array::from_fn(|i| SCHED_HIST[i].load(core::sync::atomic::Ordering::Relaxed) as u64)
 }
 
+/// Build the [`Sleep`] controller (deep sleep + the auto light-sleep idle hook).
 pub fn configure(lpwr: LPWR<'static>) -> Sleep {
     Sleep {
         #[cfg(sleep_deep_sleep)]
@@ -279,7 +323,7 @@ extern "C" fn auto_light_sleep_hook() -> ! {
 
             // A driver that released its wake lock for a bounded gap sets a deadline; past it
             // the chip must stay awake until the driver takes its lock back.
-            let deadline = WakeLock::sleep_deadline().map(|d| d.duration_since_epoch().as_micros());
+            let deadline = WakeLock::sleep_deadline_us(crate::now());
             if let Some(deadline) = deadline
                 && crate::now() >= deadline
             {
@@ -373,10 +417,7 @@ extern "C" fn auto_light_sleep_hook() -> ! {
             lpwr.sleep_light(cfg);
             note_wake_cause();
             diag_count(DIAG_SLEPT);
-            DIAG[DIAG_SLEPT_US].fetch_add(
-                crate::now().saturating_sub(before),
-                core::sync::atomic::Ordering::Relaxed,
-            );
+            DIAG_US[0].add(crate::now().saturating_sub(before));
 
             // The alarm timer was gated during light sleep, so its pre-armed alarm is
             // stale. Force a re-arm against the restored time base so the tick handler

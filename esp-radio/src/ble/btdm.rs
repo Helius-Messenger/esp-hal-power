@@ -311,18 +311,26 @@ unsafe extern "C" fn btdm_sleep_check_duration(half_slot_cnt: i32) -> i32 {
 }
 
 // Modem-sleep window diagnostics: [enter_phase1 calls, exit_phase3 wakes, sum of window
-// us, min window us, max window us].
-static MODEM_SLEEP_DIAG: [portable_atomic::AtomicU64; 5] = [
-    portable_atomic::AtomicU64::new(0),
-    portable_atomic::AtomicU64::new(0),
-    portable_atomic::AtomicU64::new(0),
-    portable_atomic::AtomicU64::new(u64::MAX),
-    portable_atomic::AtomicU64::new(0),
+// ms, min window us, max window us, sum remainder us]. Native 32-bit atomics ONLY — these
+// run in BT-controller callbacks, and a lock-based `portable_atomic::AtomicU64` (Xtensa
+// has no 64-bit atomics) can deadlock both cores against the scheduler lock (see esp-rtos
+// `sleep.rs`).
+static MODEM_SLEEP_DIAG: [core::sync::atomic::AtomicU32; 6] = [
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(u32::MAX),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
 ];
 
-/// Snapshot of the modem-sleep window diagnostics (see `MODEM_SLEEP_DIAG`).
+/// Snapshot of the modem-sleep window diagnostics: `[entries, wakes, sum window us, min
+/// window us, max window us]`.
 pub(crate) fn modem_sleep_diag() -> [u64; 5] {
-    core::array::from_fn(|i| MODEM_SLEEP_DIAG[i].load(core::sync::atomic::Ordering::Relaxed))
+    use core::sync::atomic::Ordering::Relaxed;
+    let d = |i: usize| MODEM_SLEEP_DIAG[i].load(Relaxed) as u64;
+    let min = if d(3) == u32::MAX as u64 { u64::MAX } else { d(3) };
+    [d(0), d(1), d(2) * 1000 + d(5), min, d(4)]
 }
 
 // bt.c: with CONFIG_PM the controller arms a wakeup timer slightly before the modem
@@ -357,9 +365,13 @@ unsafe extern "C" fn btdm_sleep_enter_phase1(lpcycles: i32) {
     {
         use core::sync::atomic::Ordering::Relaxed;
         MODEM_SLEEP_DIAG[0].fetch_add(1, Relaxed);
-        MODEM_SLEEP_DIAG[2].fetch_add(us_to_sleep as u64, Relaxed);
-        MODEM_SLEEP_DIAG[3].fetch_min(us_to_sleep as u64, Relaxed);
-        MODEM_SLEEP_DIAG[4].fetch_max(us_to_sleep as u64, Relaxed);
+        let r = MODEM_SLEEP_DIAG[5].fetch_add(us_to_sleep % 1000, Relaxed) + us_to_sleep % 1000;
+        if r >= 1000 {
+            MODEM_SLEEP_DIAG[5].fetch_sub(r / 1000 * 1000, Relaxed);
+        }
+        MODEM_SLEEP_DIAG[2].fetch_add(us_to_sleep / 1000 + r / 1000, Relaxed);
+        MODEM_SLEEP_DIAG[3].fetch_min(us_to_sleep, Relaxed);
+        MODEM_SLEEP_DIAG[4].fetch_max(us_to_sleep, Relaxed);
     }
     // Don't set the deadline here — hand wake_in to enter_phase2, which sets it in the same
     // branch that releases the wakelock, so exit_phase3 always clears it.

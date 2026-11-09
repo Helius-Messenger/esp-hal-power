@@ -781,9 +781,15 @@ cfg_select! {
     }
 }
 
-// Absolute time (microseconds since boot) past which automatic light sleep is refused until
-// cleared; `u64::MAX` means no deadline. See `WakeLock::set_sleep_deadline`.
-static SLEEP_DEADLINE_US: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(u64::MAX);
+// Time past which automatic light sleep is refused until cleared. See
+// `WakeLock::set_sleep_deadline`. Native 32-bit atomics only: the idle hook reads this while
+// holding the scheduler lock, and a lock-based `portable_atomic::AtomicU64` there can deadlock
+// both cores (see the note on esp-rtos `sleep.rs` counters). The low 32 bits of the µs
+// deadline are compared against `now` with wrapping arithmetic — valid for deadlines within
+// ±35 minutes of now (BLE controller sleep windows are milliseconds to seconds).
+static SLEEP_DEADLINE_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static SLEEP_DEADLINE_ARMED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// A guard that prevents the system from entering automatic light sleep.
 ///
@@ -841,23 +847,33 @@ impl WakeLock {
     /// until [`Self::clear_sleep_deadline`] is called. This mirrors the ESP-IDF pattern of a
     /// wakeup timer that re-takes the power-management lock before the controller wakes.
     pub fn set_sleep_deadline(deadline: crate::time::Instant) {
-        SLEEP_DEADLINE_US.store(
-            deadline.duration_since_epoch().as_micros(),
-            portable_atomic::Ordering::Release,
-        );
+        use core::sync::atomic::Ordering;
+        SLEEP_DEADLINE_US.store(deadline.duration_since_epoch().as_micros() as u32, Ordering::Relaxed);
+        SLEEP_DEADLINE_ARMED.store(true, Ordering::Release);
     }
 
     /// Removes the deadline set by [`Self::set_sleep_deadline`].
     pub fn clear_sleep_deadline() {
-        SLEEP_DEADLINE_US.store(u64::MAX, portable_atomic::Ordering::Release);
+        SLEEP_DEADLINE_ARMED.store(false, core::sync::atomic::Ordering::Release);
+    }
+
+    /// The deadline in µs since boot, rebuilt from its stored low 32 bits relative to the
+    /// caller's `now_us`, or `None` if none is set. Lock-free, so it is safe to call while
+    /// holding the scheduler lock.
+    pub fn sleep_deadline_us(now_us: u64) -> Option<u64> {
+        use core::sync::atomic::Ordering;
+        if !SLEEP_DEADLINE_ARMED.load(Ordering::Acquire) {
+            return None;
+        }
+        let delta = SLEEP_DEADLINE_US.load(Ordering::Relaxed).wrapping_sub(now_us as u32) as i32;
+        Some((now_us as i64 + delta as i64).max(0) as u64)
     }
 
     /// Returns the current sleep deadline, if one is set.
     pub fn sleep_deadline() -> Option<crate::time::Instant> {
-        match SLEEP_DEADLINE_US.load(portable_atomic::Ordering::Acquire) {
-            u64::MAX => None,
-            us => Some(crate::time::Instant::EPOCH + crate::time::Duration::from_micros(us)),
-        }
+        let now = crate::time::Instant::now().duration_since_epoch().as_micros();
+        Self::sleep_deadline_us(now)
+            .map(|us| crate::time::Instant::EPOCH + crate::time::Duration::from_micros(us))
     }
 
     /// Returns `true` if at least one wake lock is currently held.
