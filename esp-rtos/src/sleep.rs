@@ -148,6 +148,214 @@ pub fn configure(lpwr: LPWR<'static>) -> Sleep {
     }
 }
 
+// ── Helius fork: light-sleep / timer-queue diagnostics (bench aids) ──────────
+/// Index into [`sleep_diag`]: passes refused because a wake lock was held.
+pub const DIAG_GATE_WAKELOCK: usize = 0;
+/// Index into [`sleep_diag`]: sleeps refused by a wakeup source or the final check
+/// (`LightSleep::Refused`, e.g. the BLE controller awake).
+pub const DIAG_GATE_DEADLINE: usize = 1;
+/// Index into [`sleep_diag`]: passes refused because a core or the run queue was busy.
+pub const DIAG_GATE_NOT_IDLE: usize = 2;
+/// Index into [`sleep_diag`]: passes refused because the next wakeup was too near.
+pub const DIAG_GATE_TOO_SOON: usize = 3;
+/// Index into [`sleep_diag`]: light sleeps entered.
+pub const DIAG_SLEPT: usize = 4;
+/// Index into [`sleep_diag`]: microseconds spent in light sleep.
+pub const DIAG_SLEPT_US: usize = 5;
+
+/// Index into [`sleep_diag`]: first of four microsecond totals, one per gate in the same
+/// order as the gate counters, attributing the time between idle passes to the gate that
+/// refused the previous pass.
+pub const DIAG_GATE_US: usize = 6;
+
+// ⚠️ Every counter in this module is a NATIVE 32-bit atomic, never a 64-bit one.
+// Xtensa has no 64-bit atomics, so `portable_atomic::AtomicU64` falls back to a global
+// table of 67 spinlocks picked by address hash, taken WITHOUT masking interrupts. These
+// counters are bumped inside `SCHEDULER.with` (the idle hook, the embassy timer queue),
+// i.e. while holding the scheduler lock. If the other core holds the same hashed lock (any
+// unrelated `AtomicU64` that shares the bucket) and its task-switch interrupt fires, that
+// interrupt spins for the scheduler lock while this core spins for the fallback lock: both
+// cores hang with interrupts masked and no watchdog can run. HW-captured 2026-11-09 on an
+// ESP32-S3 (core 0 in `_embassy_time_schedule_wake` on `SCHED_HIST`'s bucket, core 1 in
+// `trigger_task_switch` interrupted inside an app `AtomicU64::store`).
+use core::sync::atomic::AtomicU32;
+
+/// A microsecond total kept as whole milliseconds plus a sub-millisecond remainder, both
+/// native 32-bit atomics (49 days before the ms word wraps, vs 71 minutes for raw µs).
+struct UsTotal {
+    ms: AtomicU32,
+    rem_us: AtomicU32,
+}
+
+impl UsTotal {
+    const fn new() -> Self {
+        Self { ms: AtomicU32::new(0), rem_us: AtomicU32::new(0) }
+    }
+
+    fn add(&self, us: u64) {
+        use core::sync::atomic::Ordering::Relaxed;
+        let r = self.rem_us.fetch_add((us % 1000) as u32, Relaxed) + (us % 1000) as u32;
+        let carry = r / 1000;
+        if carry > 0 {
+            self.rem_us.fetch_sub(carry * 1000, Relaxed);
+        }
+        self.ms.fetch_add((us / 1000) as u32 + carry, Relaxed);
+    }
+
+    fn get(&self) -> u64 {
+        use core::sync::atomic::Ordering::Relaxed;
+        self.ms.load(Relaxed) as u64 * 1000 + self.rem_us.load(Relaxed) as u64
+    }
+}
+
+static DIAG_COUNT: [AtomicU32; DIAG_SLEPT_US] = [const { AtomicU32::new(0) }; DIAG_SLEPT_US];
+/// `DIAG_SLEPT_US` then the four `DIAG_GATE_US` totals.
+static DIAG_US: [UsTotal; 5] = [const { UsTotal::new() }; 5];
+/// Low 32 bits of the last idle-pass time (µs); only ever differenced, so wrapping is fine.
+static DIAG_LAST_PASS_US: AtomicU32 = AtomicU32::new(0);
+static DIAG_LAST_GATE: portable_atomic::AtomicUsize = portable_atomic::AtomicUsize::new(usize::MAX);
+
+fn diag_count(idx: usize) {
+    DIAG_COUNT[idx].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if idx < DIAG_SLEPT {
+        let now = crate::now() as u32;
+        let last = DIAG_LAST_PASS_US.swap(now, core::sync::atomic::Ordering::Relaxed);
+        let prev = DIAG_LAST_GATE.swap(idx, core::sync::atomic::Ordering::Relaxed);
+        if prev < DIAG_SLEPT && last != 0 {
+            DIAG_US[1 + prev].add(now.wrapping_sub(last) as u64);
+        }
+    } else {
+        DIAG_LAST_GATE.store(usize::MAX, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Snapshot of the light-sleep idle hook's gate/sleep counters, indexed by the `DIAG_*`
+/// constants. Diagnostic aid for judging why the chip does or does not sleep.
+pub fn sleep_diag() -> [u64; 10] {
+    core::array::from_fn(|i| {
+        if i < DIAG_SLEPT_US {
+            DIAG_COUNT[i].load(core::sync::atomic::Ordering::Relaxed) as u64
+        } else {
+            DIAG_US[i - DIAG_SLEPT_US].get()
+        }
+    })
+}
+
+/// Histogram of the REQUESTED light-sleep duration (next_wakeup - now) at each committed
+/// sleep, so a bench can see the wake cadence (what limits sleep length). Buckets (ms):
+/// [<2, 2-4, 4-8, 8-16, 16-32, 32-64, 64-160, >=160].
+static SLEEP_HIST: [AtomicU32; 8] = [const { AtomicU32::new(0) }; 8];
+
+fn hist_bump(us: u64) {
+    let ms = us / 1000;
+    let b = if ms < 2 {
+        0
+    } else if ms < 4 {
+        1
+    } else if ms < 8 {
+        2
+    } else if ms < 16 {
+        3
+    } else if ms < 32 {
+        4
+    } else if ms < 64 {
+        5
+    } else if ms < 160 {
+        6
+    } else {
+        7
+    };
+    SLEEP_HIST[b].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Snapshot of the requested-sleep-duration histogram (see [`SLEEP_HIST`]).
+pub fn sleep_hist() -> [u64; 8] {
+    core::array::from_fn(|i| SLEEP_HIST[i].load(core::sync::atomic::Ordering::Relaxed) as u64)
+}
+
+/// Attributes timer-queue task wakeups by task priority, so a bench can see WHICH tasks are
+/// waking the system (the "remaining wakers"). Buckets: [prio 0 = app/thread executor,
+/// prio 1-2 = LoRa hp-thread / esp-radio timer thread, prio 3-15, prio 16-31 = BTDM
+/// controller task]. Only counts wakeups delivered via the RTOS timer queue (embassy
+/// `Timer` expirations / scheduled task wakeups), not direct hardware-IRQ wakeups.
+static WAKE_BY_PRIO: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
+
+pub(crate) fn note_timer_wake(prio: usize) {
+    let b = if prio == 0 {
+        0
+    } else if prio <= 2 {
+        1
+    } else if prio <= 15 {
+        2
+    } else {
+        3
+    };
+    WAKE_BY_PRIO[b].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Snapshot of timer-queue wakeups by priority bucket (see [`WAKE_BY_PRIO`]).
+pub fn wake_by_prio() -> [u64; 4] {
+    core::array::from_fn(|i| WAKE_BY_PRIO[i].load(core::sync::atomic::Ordering::Relaxed) as u64)
+}
+
+/// The HARDWARE wakeup cause after each committed light sleep, read from the RTC/PMU wakeup
+/// status. This is the DEFINITIVE "what woke the SoC": buckets [Timer, Bt, Gpio, Uart, Ext1,
+/// Other/none]. Timer = a scheduled deadline (embassy or esp-rtos); Bt = the BLE controller;
+/// the rest = peripheral pads / UART RX.
+static WAKE_CAUSE: [AtomicU32; 6] = [const { AtomicU32::new(0) }; 6];
+
+fn note_wake_cause() {
+    use esp_hal::rtc_cntl::WakeupSource as S;
+    let r = esp_hal::rtc_cntl::wakeup_cause();
+    let b = if r.contains(S::Timer) {
+        0
+    } else if r.contains(S::Bt) {
+        1
+    } else if r.contains(S::Gpio) {
+        2
+    } else if r.contains(S::Uart0) || r.contains(S::Uart1) {
+        3
+    } else if r.contains(S::Ext1) {
+        4
+    } else {
+        5
+    };
+    WAKE_CAUSE[b].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Snapshot of the hardware wakeup-cause counters (see [`WAKE_CAUSE`]).
+pub fn wake_cause() -> [u64; 6] {
+    core::array::from_fn(|i| WAKE_CAUSE[i].load(core::sync::atomic::Ordering::Relaxed) as u64)
+}
+
+/// Histogram of the delays EMBASSY tasks schedule (`Timer::after` etc.), so a bench can see
+/// each task's period (one hot fast timer vs many slow ones). Buckets (ms): [<4, 4-16,
+/// 16-64, 64-256, 256-1024, >=1024].
+static SCHED_HIST: [AtomicU32; 6] = [const { AtomicU32::new(0) }; 6];
+
+pub(crate) fn note_sched(delay_us: u64) {
+    let ms = delay_us / 1000;
+    let b = if ms < 4 {
+        0
+    } else if ms < 16 {
+        1
+    } else if ms < 64 {
+        2
+    } else if ms < 256 {
+        3
+    } else if ms < 1024 {
+        4
+    } else {
+        5
+    };
+    SCHED_HIST[b].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Snapshot of the embassy scheduled-delay histogram (see [`SCHED_HIST`]).
+pub fn sched_hist() -> [u64; 6] {
+    core::array::from_fn(|i| SCHED_HIST[i].load(core::sync::atomic::Ordering::Relaxed) as u64)
+}
+
 /// Answers whether the sleep that the idle hook decided on may start.
 ///
 /// esp-hal calls this after it parked the other cores. Until the sleep ends, no other core can then
@@ -173,23 +381,26 @@ extern "C" fn auto_light_sleep_hook() -> ! {
 
         let sleep = SCHEDULER.with(|scheduler| {
             if WakeLock::is_active() {
-                return false;
+                diag_count(DIAG_GATE_WAKELOCK);
+                return None;
             }
 
             #[cfg(multi_core)]
             {
                 if scheduler.run_queue.has_ready_tasks() {
-                    return false;
+                    diag_count(DIAG_GATE_NOT_IDLE);
+                    return None;
                 }
                 for cpu in Cpu::all() {
                     if !scheduler.cpu_idle(cpu) {
-                        return false;
+                        diag_count(DIAG_GATE_NOT_IDLE);
+                        return None;
                     }
                 }
             }
 
             let Some(time_driver) = scheduler.time_driver.as_mut() else {
-                return false;
+                return None;
             };
             let next_wakeup = time_driver.next_wakeup();
 
@@ -206,14 +417,16 @@ extern "C" fn auto_light_sleep_hook() -> ! {
                 lpwr.set_wakeup_deadline(Instant::EPOCH + Duration::from_micros(next_wakeup));
 
                 if next_wakeup.saturating_sub(crate::now()) < LIGHT_SLEEP_MIN_US {
-                    return false;
+                    diag_count(DIAG_GATE_TOO_SOON);
+                    return None;
                 }
             }
 
-            true
+            Some(next_wakeup)
         });
 
-        if sleep {
+        if let Some(next_wakeup) = sleep {
+            let before = crate::now();
             // Each driver enables the wakeup source it owns. This hook does not know which
             // sources are enabled. `sleep_light_if` returns immediately when none are enabled.
             // It also returns immediately when a source refuses the sleep. Do not call it
@@ -221,6 +434,17 @@ extern "C" fn auto_light_sleep_hook() -> ! {
             // waits for an interrupt.
             let result = LowPower::new(unsafe { LPWR::steal() })
                 .sleep_light_if(RtcSleepConfig::default(), may_sleep);
+            // Diagnostics: `Ended` also covers a sleep that never started, so the
+            // slept-µs total is the more trustworthy number. A refusal (a wakeup
+            // source or the final check) is counted in the DEADLINE slot.
+            if result == LightSleep::Ended {
+                hist_bump(next_wakeup.saturating_sub(before));
+                note_wake_cause();
+                diag_count(DIAG_SLEPT);
+                DIAG_US[0].add(crate::now().saturating_sub(before));
+            } else {
+                diag_count(DIAG_GATE_DEADLINE);
+            }
 
             SCHEDULER.with(|scheduler| {
                 let Some(time_driver) = scheduler.time_driver.as_mut() else {
