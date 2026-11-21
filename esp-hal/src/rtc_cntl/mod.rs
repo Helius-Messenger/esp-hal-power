@@ -879,6 +879,15 @@ impl WakeLock {
         }
     }
 
+    /// Returns the number of wake locks currently held.
+    #[instability::unstable]
+    pub fn holders() -> usize {
+        cfg_select! {
+            sleep_light_sleep => wake_lock_count().load(portable_atomic::Ordering::Acquire),
+            _ => 0,
+        }
+    }
+
     /// Returns whether at least one wake lock is currently held.
     #[instability::unstable]
     pub fn is_active() -> bool {
