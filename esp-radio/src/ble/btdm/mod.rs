@@ -2,7 +2,7 @@ use alloc::boxed::Box;
 use core::{ptr::NonNull, task::Poll};
 
 use esp_phy::PhyInitGuard;
-use portable_atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use portable_atomic::{AtomicBool, AtomicU32, Ordering};
 
 use super::{Config, ReceivedPacket};
 #[cfg(feature = "coex")]
@@ -288,7 +288,12 @@ unsafe extern "C" fn btdm_sleep_check_duration(slot_cnt: i32) -> i32 {
 
 /// When the chip must be awake again, in microseconds since boot. Zero while the controller does
 /// not sleep.
-static CHIP_WAKE_AT_US: AtomicU64 = AtomicU64::new(0);
+// Low 32 bits of the µs timestamp the controller wakes at (0 = not sleeping).
+// 32-bit on purpose: a `portable_atomic::AtomicU64` falls back to a spinlock on
+// Xtensa, and these stores run from the controller blob on core 0 — a thread
+// preempted mid-store on the same lock bucket deadlocks them. Wrapping
+// arithmetic is exact for any sleep shorter than ~35 minutes.
+static CHIP_WAKE_AT_US: AtomicU32 = AtomicU32::new(0);
 
 #[ram]
 unsafe extern "C" fn btdm_sleep_enter_phase1(lpcycles: i32) {
@@ -324,7 +329,7 @@ unsafe extern "C" fn btdm_sleep_enter_phase1(lpcycles: i32) {
     let now = esp_hal::time::Instant::now()
         .duration_since_epoch()
         .as_micros();
-    let wake_at = now + u64::from(us_to_sleep.saturating_sub(uncertainty));
+    let wake_at = (now as u32).wrapping_add(us_to_sleep.saturating_sub(uncertainty));
     CHIP_WAKE_AT_US.store(wake_at.max(1), Ordering::Relaxed);
 }
 
@@ -333,10 +338,14 @@ unsafe extern "C" fn btdm_sleep_enter_phase1(lpcycles: i32) {
 /// Returns zero when the chip must not sleep.
 pub(super) fn time_until_controller_wakes() -> esp_hal::time::Duration {
     let wake_at = CHIP_WAKE_AT_US.load(Ordering::Relaxed);
+    if wake_at == 0 {
+        return esp_hal::time::Duration::from_micros(0);
+    }
     let now = esp_hal::time::Instant::now()
         .duration_since_epoch()
-        .as_micros();
-    esp_hal::time::Duration::from_micros(wake_at.saturating_sub(now))
+        .as_micros() as u32;
+    let remaining = wake_at.wrapping_sub(now) as i32;
+    esp_hal::time::Duration::from_micros(remaining.max(0) as u64)
 }
 
 unsafe extern "C" fn btdm_sleep_enter_phase2() {
