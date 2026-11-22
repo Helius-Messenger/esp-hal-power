@@ -117,7 +117,9 @@ system_clocks = { clock_tree = [
         { name = "MEM_CLOCK", type = "generic", output = "UART_MEM_CLK" },
     ] },
     { group = "I2C", clocks = [
-        { name = "FUNCTION_CLOCK", type = "generic", wake_locking = true, output = "sclk / (div_num + 1)", params = { sclk = [
+        # Helius: no wake lock for the lifetime of the driver — an idle I2C/SPI master survives light
+        # sleep (clock gated, state kept); the application holds a WakeLock around its transfers.
+        { name = "FUNCTION_CLOCK", type = "generic", output = "sclk / (div_num + 1)", params = { sclk = [
             { name = "XTAL",    outputs = "XTAL_CLK", default = true },
             { name = "RC_FAST", outputs = "RC_FAST_CLK" },
         ], div_num = "0 .. 0x100" } },
@@ -139,7 +141,9 @@ system_clocks = { clock_tree = [
         ], div_num = "2 ..= 256", div_a = "1 ..= 63", div_b = "0 ..= 63" } },
     ] },
     { group = "SPI", clocks = [
-        { name = "FUNCTION_CLOCK", type = "mux", wake_locking = true, variants = [
+        # Helius: no wake lock for the lifetime of the driver — an idle I2C/SPI master survives light
+        # sleep (clock gated, state kept); the application holds a WakeLock around its transfers.
+        { name = "FUNCTION_CLOCK", type = "mux", variants = [
             { name = "XTAL", outputs = "XTAL_CLK" },
             { name = "APB",  outputs = "APB_CLK", default = true }, # PLL_F80M?
         ] },
