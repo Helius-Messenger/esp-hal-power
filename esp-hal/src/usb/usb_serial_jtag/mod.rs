@@ -365,7 +365,7 @@ pub struct UsbSerialJtag<'d, Dm: DriverMode> {
 pub struct UsbSerialJtagTx<'d, Dm: DriverMode> {
     peripheral: USB_DEVICE<'d>,
     phantom: PhantomData<Dm>,
-    wake_lock: WakeLock,
+    wake_lock: Option<WakeLock>,
     /// The host has not seen the end of the transfer: the FIFO holds bytes, or the last packet
     /// had 64 bytes.
     transfer_open: bool,
@@ -754,11 +754,21 @@ impl<'d, Dm> UsbSerialJtagTx<'d, Dm>
 where
     Dm: DriverMode,
 {
+    /// Helius: lets the chip light-sleep while this transmitter exists.
+    ///
+    /// The transmitter otherwise keeps a wake lock for its whole lifetime, so a firmware that
+    /// keeps one as its log sink never sleeps. Bytes written while the chip sleeps go out after
+    /// the next wake.
+    #[instability::unstable]
+    pub fn allow_light_sleep(&mut self) {
+        self.wake_lock = None;
+    }
+
     fn new_inner(peripheral: USB_DEVICE<'d>) -> Self {
         Self {
             peripheral,
             phantom: PhantomData,
-            wake_lock: WakeLock::new(),
+            wake_lock: Some(WakeLock::new()),
             transfer_open: false,
             tx_timeout: None,
             timed_out: false,
